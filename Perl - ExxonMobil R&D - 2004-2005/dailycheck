@@ -1,0 +1,649 @@
+#!/bin/sh
+#############################################################################
+##
+## Daily Check CRONTAB Script
+##
+## This script which should run daily checks for the following:
+##
+##   01. Checks to ensure that /etc/passwd and shadow permissions 
+##      and ownership are set properly;
+##   02. Verify that all accounts have a password;
+##   03. Check system logs:
+##   03a. Check for su attempts
+##   03b. Check for ftp attempts
+##   03c. Check for system errors
+##   04. Checks in user space:
+##   04a. Checks for root-owned files;
+##   04b. Checks for permissions on .rc files;
+##   04c. Checks for world writable directories;
+##   04d. Checks for world writable files;
+##   05. Checks for accounts with SU privileges;
+##   06. Check changes in suid executables;
+##   07. Check presence of /bin/nosuchshell;
+##   08. Check upper bounds on disk space (per partition).
+##   09. Check permissions of root's .rc files.
+##   10. Check permissions of tmp directories.
+##
+## The purpose of daylycheck is to report errors ONLY if they occur.
+##
+## Tests performed obey two simple rules:
+##
+##        - outcome of the test is pass or fail;
+##        - what is checked for is crucial enough to be verified
+##          on a daily basis.
+##
+#############################################################################
+### Preliminaries. This should be general enough for any system.
+##########################################################################
+## Any variable in format ++VARIABLE++ is properly configured
+## when installed by certify script (./certify Config_Cron).
+## If installed by hand look for '++' and 
+## configure appropriately.
+
+## List of partitions to check to space. Format:
+## [mount path 1]:[upper bound in %] [mount path 2]:[upper bound 2] ...
+## For example:
+PARTITIONS="/:80 /tmp:50"
+##PARTITIONS=" /dev/hda9:90 /dev/hda1:90 /dev/hda10:90 /dev/hda6:90 /dev/hda5:90 /dev/hda8:90 /dev/md0:98 /dev/sdc1:90"
+##PARTITIONS=" /dev/dsk/c0t0d0s0:90 /dev/dsk/c0t0d0s6:90 /dev/dsk/c0t0d0s1:90"
+
+## Path to BSD mail.
+## For example:
+## BSDmailer="/usr/bin/mail"
+BSDmailer="/bin/mail"
+
+## Flag find -local if supported.
+## For example:
+## LOCAL=""
+LOCAL="-mount"
+
+## Pruning flags
+## For example:
+## PRUNE="\( -fstype nfs -o -fstype auto \)"
+PRUNE="\( -fstype nfs -o -fstype auto -o -fstype autofs -o -name proc \)"
+
+## Command for df'ing the disks.
+## For example:
+## DF="/bin/df -k"
+DF="/bin/df -k"
+
+## How to find a soft link
+## Typically: -L or -h
+TESTLINK="-L"
+
+## First, set pathnames & options for system commands used in this script.
+PATH="/bin:/usr/bin:/sbin:/usr/sbin:/etc:/usr/etc:/usr/bsd:/usr/ucb"
+UMASK=700
+
+## Echo that understands echo -n.
+NECHO="echo -n"
+
+## Guess what.
+HOSTNAME="`uname -n`"
+
+## Some internal short cuts. Where to put stuff
+## we have to remember and compare to day after day.
+SUIDLIST="/etc/certify/.suidlist"
+ROOTLIST="/etc/certify/.zuidlist"
+
+## Pathnames for users' home directory area are amongst:
+HOMELIST="/usr/people /user/people1 /usr/people2 \
+/home /users /usr/users /export/home"
+
+## Exceptions for user-space directories allowed to have
+## root-owned files or world-writable directories
+EXCEPTDIRS="ftp httpd tmp www orphans"
+
+## Name of shadow file
+SHADOWFILE="/etc/shadow"
+
+## System log files that need to be checked are amongst:
+## Not used for now.
+LOGLIST="/var/adm/SYSLOG /var/adm/messages /var/adm/syslog /var/log/secure \
+/var/adm/secure /var/log/syslog /var/adm/MESSAGES /var/log/messages"
+
+## su log list is one of:
+SULOGLIST="/var/adm/sulog /usr/adm/sulog /var/log/secure /var/log/messages \
+/var/adm/secure"
+
+## List of possible tmp directories
+TMPLIST="/tmp /usr/tmp /var/tmp /home/tmp /users/tmp"
+
+## List of sensitive .rc files (used for root only)
+RCLIST=".bashrc .cshrc .exrc .history .kshrc .login .logout \
+.mailrc .netrc .profile .rhosts .sh_history .sgisession .tcshrc \
+.Xclients .Xdefaults .xinitrc .xsession .zmailrc"
+
+##########################################################################
+## This is some internal stuff
+
+## These are temp and output files.
+report=/tmp/$$.out
+toreport=/tmp/$$.rep
+tmp=/tmp/$$.1
+tmp2=/tmp/$$.2
+
+## if critical is set to 1 we send e-mail otherwise we don't.
+critical=0
+
+## define report function.
+reporterr () {
+    critical=1
+    echo "" >> $report
+    echo "++++++++++++++++++++++++++++++++++++++++++++++++++++++++++" >> $report
+    $NECHO "ALERT: " >> $report
+    echo "$errormsg" >> $report
+    echo "----------------------------------------------------------" >> $report
+    cat $toreport >> $report
+    echo "----------------------------------------------------------" >> $report
+    echo "$solution" >> $report
+    echo "++++++++++++++++++++++++++++++++++++++++++++++++++++++++++" >> $report
+    echo "" >> $report
+}
+
+#######################################################################
+## Nuff said. Here we start:
+#######################################################################
+
+rm -f $toreport $tmp $report
+
+##########################################################
+### 0. Start building output file just in case we need it.
+##########################################################
+
+cat > $report << _End
+
+>>> =====================================================
+>>> Daily Security Checkup on Host $HOSTNAME
+>>> =====================================================
+Current time is `date`
+
+System Uptime:  `uptime`
+
+This report has been generated either because your system
+failed to comply to fundamental Exxon security rules, or
+because an alert was triggered due to a change that occurred
+in the configuration of your system that could potentially
+invalidate the network certification of your workstation.
+
+Please take the messages below very seriously.  In case of
+doubt, or if you need any help in resolving the problems
+listed below, do not hesitate to contact your local Computer
+Security Officer or the UNIX Operations Group (email UNIXID).
+
+_End
+
+##############################################
+### 1. Checking password files permissions.
+##############################################
+solution="Please fix immediately."
+
+## read does not read from a pipe.
+## If something is wrong, file $toreport is included in report
+## by reporterr() anyway.
+ls -l /etc/passwd > $toreport
+read perms links uowner gowner junk < $toreport
+
+case $perms in
+    ?r--r--r--|?rw-r--r--)
+    ;;
+
+    *)
+    errormsg="Password file /etc/passwd has unacceptable permissions:"
+    reporterr
+    ;;
+esac
+
+if [ "K$uowner" != "Kroot" ] ; then
+    errormsg="Password file /etc/passwd has unacceptable ownership:"
+    reporterr
+fi
+
+case $gowner in
+    root|sys|system|security|bin)
+    ;;
+
+    *)
+    errormsg="Password file /etc/passwd has unacceptable group ownership:"
+    reporterr
+    ;;
+esac
+
+## Now do the same thing with shadow file if present
+
+if [ -f $SHADOWFILE ]; then
+    # read does not read from a pipe.
+    ls -l $SHADOWFILE > $toreport
+    read perms links uowner gowner junk < $toreport
+
+    case $perms in
+        ?r--------)
+        ;;
+
+        ?r--r-----)
+        if [ "K$gowner" != "Kshadow" ] ; then
+            errormsg="Password file $SHADOWFILE has unacceptable permissions:"
+            reporterr
+        fi
+        ;;
+    
+        *)
+        errormsg="Password file $SHADOWFILE has unacceptable permissions:"
+        reporterr
+        ;;
+    esac
+    
+    if [ "K$uowner" != "Kroot" ] ; then
+        errormsg="Password file $SHADOWFILE has unacceptable ownership:"
+        reporterr
+    fi
+    
+    case $gowner in
+        root|sys|shadow|system|security)
+        ;;
+    
+        *)
+        errormsg="Password file $SHADOWFILE has unacceptable group ownership:"
+        reporterr
+        ;;
+    esac
+fi
+
+###############################################
+### 2. Checking for accounts without passwords.
+###############################################
+
+egrep '^[^:]*::' /etc/passwd > $toreport
+if [ $? -eq 0 ] ; then
+    errormsg="Accounts with no password were found in /etc/passwd:"
+    reporterr
+fi
+
+if [ -f $SHADOWFILE ] ; then
+    egrep '^[^:]*::' $SHADOWFILE > $toreport
+    if [ $? -eq 0 ] ; then
+        errormsg="Accounts with no password were found in ${SHADOWFILE}:"
+        reporterr
+    fi
+fi
+
+#################################################
+### 3. Check system logs
+#################################################
+
+## calculate yesterday's date
+month=`date +%m`
+OS=`uname -s`
+case ${OS} in 
+     Solaris|SunOS)
+       smonth=`date +%h`
+       ;;
+     *) 
+       smonth=`date +%b`
+       ;;
+esac
+day=`date +%d`
+day=`expr $day - 01`
+
+##
+## If day lt 1, need to subtract 1 from month and figure out
+## if previous month had 28,29,30, or 31 days so can set day accordingly.
+## If month less than 1, need to make it 12 & sub 1 from year
+## unless is turn of century ....
+
+if [ $day -lt 1 ] ; then
+    month=`expr $month - 1`
+    if [ "$month" -lt 1 ] ; then
+        month=12
+    fi
+    ## Need to reset alpha month for SYSLOG lookup
+    case $month in
+      1|01)
+         smonth="Jan"
+         day=31 ;;
+      2|02)
+         smonth="Feb"
+         ## If year divisible by 4 and not divisible by 100
+         ## unless also divisible by 400 then day=29
+         day=28 ;;
+      3|03)
+         smonth="Mar"
+         day=31 ;;
+      4|04)
+         smonth="Apr"
+         day=30 ;;
+      5|05)
+         smonth="May"
+         day=31 ;;
+      6|06)
+         smonth="Jun"
+         day=30 ;;
+      7|07)
+         smonth="Jul"
+         day=31 ;;
+      8|08)
+         smonth="Aug"
+         day=31 ;;
+      9|09)
+         smonth="Sep"
+         day=30 ;;
+      10)
+         smonth="Oct"
+         day=31 ;;
+      11)
+         smonth="Nov"
+         day=30 ;;
+      12)
+         smonth="Dec"
+         day=31 ;;
+      *)
+         echo '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!' >> $report
+         echo "PANIC: month value resolved to $month." >> $report
+         echo "Invalid date calculation: Please check script $0." >> $report
+         $BSDmailer -s "Failed Security Alert for host `hostname`" UnixAdmin@exxonmobil.com < $report
+         rm -f $report $toreport $tmp
+         exit 1 ;;
+    esac
+fi
+
+#****************
+# 3a. Check for SU attempts
+#****************
+
+for i in $SULOGLIST ; do
+    if [ -f $i ] ; then
+        # Some are Sep  3, others 09/02
+        egrep "${month}[/0]*${day}[ ]|${smonth}[ 0]*${day}[ ]" ${i} | \
+    	egrep "su:|SU|\(su\)" > $toreport
+        if [ -s $toreport ] ; then
+            errormsg="SU attempt(s) detected:"
+            solution="Please inquire immediately with concerned users."
+            reporterr
+        fi
+    fi
+done
+ 
+#****************
+# 3b. Check for ftp accesses
+#****************
+yesterday="${smonth} ${space}${day}"
+for i in ${LOGLIST} ; do
+    if [ -f $i ] ; then
+        egrep "${month}[/0]*${day}[ ]|${smonth}[ 0]*${day}[ ]" ${i} | \
+        egrep -i "rexd|rexecd|ftp" > $toreport
+        if [ -s $toreport ] ; then
+            errormsg="FTP Accesses detected:"
+            solution="Please make sure all file transfers are appropriate."
+            reporterr
+        fi
+    fi 
+done  
+
+#******************************
+### 3c. Check for system errors
+#******************************
+yesterday="${smonth} ${space}${day}"
+for i in ${LOGLIST} ; do
+    if [ -f $i ] ; then
+        egrep "${month}[/0]*${day}[ ]|${smonth}[ 0]*${day}[ ]" ${i} | \
+        egrep -i "scsi|kernel: |unix: |memory|reboot|panic |uncorrectable|RAID" > $toreport
+        if [ -s $toreport ] ; then
+            errormsg="Possible system errors detected:"
+            solution="Please investigate."
+            reporterr
+        fi
+    fi
+done
+
+###################################################
+### 4. Checking user space:
+###     1) .rc files permissions,
+###     2) world-writable directories,
+###     3) world-writable files, and
+###     4) root-owned files.
+###################################################
+solution="Please check with concerned users."
+
+cat /dev/null > ${toreport}.1
+cat /dev/null > ${toreport}.2
+cat /dev/null > ${toreport}.3
+cat /dev/null > ${toreport}.4
+
+for i in $HOMELIST ; do
+    [ $TESTLINK $i ] && continue
+    if [ -d $i ] ; then
+        for j in $i/* ; do
+    		[ $TESTLINK $j ] && continue
+            if [ -d $j ] ; then
+
+                # Check permissions of .rc files
+                eval "find $j $LOCAL $PRUNE -prune -o \
+		-name $j/'.[a-zA-Z]*' -type f \
+                \( ! -perm 0400 -a ! -perm 0600 -a ! -perm 0700 \) \
+                -print" >> ${toreport}.1
+
+				ok=0
+                # forgive following directories
+				for xx in $EXCEPTDIRS ; do
+                	if [ "K$j" = "K$i/$xx" ] ; then
+						ok=1
+						break
+					fi
+				done
+				[ $ok -eq 1 ] && continue
+
+                # Check permissions for world-writable directories
+                eval "find $j $LOCAL $PRUNE -prune -o \
+		-type d \( -perm -0002 \) \
+                -print" >> ${toreport}.2
+
+                # Check permissions for world-writable files
+                eval "find $j $LOCAL $PRUNE -prune -o \
+		-type f \( -perm -0002 \) \
+                -print" >> ${toreport}.3
+
+                # Check for root-owned files in user space
+                eval "find $j $LOCAL $PRUNE -prune -o \
+		-type f -user root -print" >> ${toreport}.4
+            fi
+        done
+    fi
+done
+
+if [ -s ${toreport}.1 ] ; then
+    mv ${toreport}.1 $toreport
+    errormsg="Opened .rc files were found in user space:"
+    reporterr
+fi
+
+if [ -s ${toreport}.2 ] ; then
+    mv ${toreport}.2 $toreport
+    errormsg="World-writable directories were found in user space:"
+    reporterr
+fi
+
+if [ -s ${toreport}.3 ] ; then
+    mv ${toreport}.3 $toreport
+    errormsg="World-writable files were found in user space:"
+    reporterr
+fi
+
+if [ -s ${toreport}.4 ] ; then
+    mv ${toreport}.4 $toreport
+    errormsg="Root-owned files were found in user space:"
+    reporterr
+fi
+
+rm -f ${toreport}.1 ${toreport}.2 ${toreport}.3 ${toreport}.4
+
+##################################################
+### 5. Display accounts with superuser privileges.
+##################################################
+solution="Please inquire immediately."
+
+egrep '^[^:]*:[^:]*:0:' /etc/passwd > $toreport
+
+if [ -r $ROOTLIST ] ; then
+    diff $ROOTLIST $toreport 2>&1
+    if [ $? -eq 1 ] ; then
+        errormsg='Accounts with root privileges were removed (<) and/or added (>):'
+        reporterr
+    fi
+fi
+
+# update the list
+mv $toreport $ROOTLIST
+chmod 400 $ROOTLIST
+
+#################################################
+### 6. Checking new suid executables.
+#################################################
+# solution="Please inquire immediately."
+
+eval "find / $LOCAL $PRUNE -prune -o \
+\( -perm -04000 -o -perm -02000 \) -type f -print" > $tmp2
+if [ -s $tmp2 ] ; then
+	sum `cat $tmp2` > $tmp
+#else
+#	errormsg='No suid were found!'
+#	reporterr
+fi
+
+if [ -r $SUIDLIST ] ; then
+    diff $SUIDLIST $tmp > $toreport
+    if [ $? -eq 1 ] ; then
+        errormsg='Suid programs were changed (previous: <, current: >):'
+		reporterr
+    fi
+fi
+
+# update the list
+if [ -s $tmp ] ; then
+	mv $tmp $SUIDLIST
+	chmod 400 $SUIDLIST
+fi
+
+#################################################
+### 7. Checking for /bin/nosuchshell.
+#################################################
+# solution="Please inquire immediately."
+
+if [ -f /bin/nosuchshell -o $TESTLINK /bin/nosuchshell ] ; then
+    ls -l /bin/nosuchshell > $toreport
+    errormsg="Found a file /bin/nosuchshell:"
+    reporterr
+fi
+
+#################################################
+### 8. Checking bounds on disk partition.
+#################################################
+
+## first find which field has percent
+field=0
+for i in `$DF / | head -1` ; do
+    field=`expr $field + 1`
+    case $i in
+        *%*) break ;;
+        [cC]apacity) break ;;
+        *) ;;
+    esac
+done
+
+if [ $field -eq 0 ] ; then
+    echo '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!' >> $report
+    echo "PANIC: Cannot resolve df field." >> $report
+    echo "Please check script $0." >> $report
+    $BSDmailer -s "Failed Security Alert for host `hostname`" UnixAdmin@exxonmobil.com < $report
+    rm -f $report $toreport $tmp $tmp2
+fi
+
+for i in $PARTITIONS ; do
+    mntpt="`echo $i | cut -d: -f1`"
+    ubound="`echo $i | cut -d: -f2`"
+
+    $DF $mntpt | tail +2 > $toreport
+    set `cat $toreport`
+    value=`eval echo \\$$field | sed 's/%//'`
+    if [ $value -gt $ubound ] ; then
+        errormsg="Partition $mntpt is above upper bound $ubound."
+		cat << _End > $toreport
+ You can change upper bound value on $mntpt by
+ adjusting the PARTITIONS variable found in script file
+ "/etc/certify/dailycheck".
+
+_End
+    	$DF $mntpt >> $toreport
+        solution='Time to backup old files ?'
+        reporterr
+    fi
+done
+
+##########################################################
+### 09. Check Permissions of root's .rc files.
+##########################################################
+
+## Most OSs give / as root's HOME. Linux and FreeBSD use /root.
+
+if [ -d /root ] ; then
+    roothome="/root"
+else
+    roothome="/"
+fi
+
+for i in $RCLIST ; do
+    if [ -f $roothome/$i ] ; then
+        # read does not read from a pipe.
+        ls -l $roothome/$i > $toreport
+        read perms links uowner gowner junk < $toreport
+        case $perms in
+            ?r--------|?rw-------|?rwx------)
+            ;;
+
+            *)
+            errormsg="File $i has unacceptable permissions:"
+            solution="Please fix immediately (chmod 600 $i)."
+            reporterr
+            ;;
+        esac
+
+        if [ "K$uowner" != "Kroot" ] ; then
+            errormsg="File $i has unacceptable ownership:"
+            reporterr
+        fi
+    fi
+done
+
+#################################################
+### 10. Checking permissions on tmp directories.
+#################################################
+
+for i in $TMPLIST; do
+    [ $TESTLINK $i ] && continue
+    if [ -d $i ] ; then
+        ls -ld $i > $toreport
+        read perms junk < $toreport
+        case ${perms} in
+             drwxrwxrwt|drwxrwsrwt)
+                ;;
+             *)
+                errormsg="Temporary directory $i has wrong permissions."
+                solution="Please fix immediately (chmod 1777 $i)."
+                reporterr
+                ;;
+        esac
+    fi
+done
+
+#################################################
+### 99. Mail report to root if any result.
+#################################################
+
+if [ $critical -eq 1 ] ; then
+    echo "==========================================================" >> $report
+    $BSDmailer -s "Security Alert for host `hostname`" UnixAdmin@exxonmobil.com < $report
+fi
+
+## Cleanup
+rm -f $report $toreport $tmp $tmp2
+
+exit 0

@@ -1,0 +1,279 @@
+#!/usr/bin/perl -w
+###################################################
+# What : Perform some basic system health test and mail'em 
+# Where: GIS Linux/Unix hosts, C3 to start with
+# Who  : MQ
+# When : 05/2004
+# Will modify it as needed, when different/more info is required
+#
+# Executed : 8am, 10am, noon, 2pm, 4pm by cron (eventually)
+#
+####################################################
+
+use System::Unix;
+use IO::Handle;
+use Carp;
+use sigtrap qw(die normal-signals error-signals);
+
+our $VERSION = 1.0.0;
+
+my ($MAIL_LIST, $NOMAIL, $NOOF_TOPLINES) = ('root', 0, 10);
+
+my %SystemChecks = ( 'SYSLOG'    => \&CheckSystemLog,
+                     'KERNEL'    => \&CheckKernelLog,
+                     'BACKUP'    => \&CheckBackupLog,
+                     'SECURE'    => \&CheckSecurity,
+                     'SYSMON'    => \&CheckSysMon,
+                     'PBS_Q'     => \&CheckQueueStat,
+                     'PROCS'     => \&CheckProcesses,
+                     'NODEPROPS' => \&CheckNodeProps,
+                     'HARDWARE'  => \&CheckHardware,
+                     'TOPPROC'   => \&CheckTopProcesses,
+                     'NON-EXIST' => \&Oops
+                   );
+
+my %HostCheckMatrix = (
+    tests => [ 'SYSLOG', 'KERNEL', 'BACKUP', 'SECURE', 'SYSMON', 'PBS_Q', 'PROCS', 'NODEPROPS', 'HARDWARE', 'TOPPROC' ],
+    uayeb => [     1,       1,        0,        0,         1,       0,       0,         0,           1,         0     ],
+   kronos => [     1,       1,        0,        0,         1,       0,       0,         0,           1,         0     ],
+ clnsand1 => [     1,       1,        0,        0,         0,       0,       0,         0,           0,         1     ],
+    champ => [     1,       1,        0,        0,         0,       0,       0,         0,           0,         1     ],
+);
+
+
+sub Oops
+{
+   my ($test) = @_;
+
+   print LOGFILE "\n\nOops .. you've specified a non-existing test : $test\n\n";
+   return 0;
+}
+
+sub CheckBackupLog
+{
+   # no need to this for now .. done by other script
+   return 0;
+}
+
+sub CheckSecurity
+{
+   # no need to this for now .. done by other script
+   return 0;
+}
+
+sub CheckTopProcesses
+{
+   my ($thisHost, @topprocs) = (shift, ());
+
+   print LOGFILE "\n------- $thisHost->{CMD}->{TOP} results --------\n";
+   @topprocs = qx { $thisHost->{CMD}->{TOP} $thisHost->{PARAM}->{TOP} };   # Just a snapshot for what it's worth
+   print LOGFILE splice(@topprocs, 0, $NOOF_TOPLINES + $thisHost->{VAR}->{TOP_OFFSET}), "\n";
+
+   return 0;
+}
+
+sub CheckSystemLog
+{
+   my ($thisHost, @errors) = (shift, ());
+   my ($date, $day, $month);
+   my @month_str = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec');
+
+   # I'm not interested in login failures, I see my name too often :-))
+   # don't wanna see yesterdays errors either .. would be nice to have the Date module
+   ($day, $month) = (localtime)[3,4];
+   $date = $month_str[$month] . ' ' . $day;
+   @errors = qx { $thisHost->{CMD}->{EGREP} -i 'error|fail' $thisHost->{FILES}->{SYSLOG} | 
+                  $thisHost->{CMD}->{EGREP} -vi 'auth' | 
+                  $thisHost->{CMD}->{EGREP} -v 'ifconfig' | 
+                  $thisHost->{CMD}->{EGREP} "$date" 
+                };
+   if (scalar(@errors)) {
+      print LOGFILE "\n------- $thisHost->{FILES}->{SYSLOG} --------";
+      print LOGFILE "\n\n@errors\n";
+   }
+
+   return 0;
+}
+
+sub CheckKernelLog
+{
+   my ($thisHost, @kernel, @errors) = (shift, (),());
+   my ($date, $day, $month);
+   my @month_str = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec');
+
+   ($day, $month) = (localtime)[3,4];
+   $date = $month_str[$month] . ' ' . $day;
+   @kernel = qx { $thisHost->{CMD}->{FOREACHNODE} $thisHost->{CMD}->{DMESG} | $thisHost->{CMD}->{EGREP} "$date" };
+   @errors = grep { /fail/i || /error/i } @kernel;
+   if (scalar(@errors)) {
+      print LOGFILE "\n------- $thisHost->{CMD}->{DMESG} results --------";
+      print LOGFILE "\n\n@errors\n";
+   }
+   return 0;
+}
+
+sub CheckSysMon
+{
+   my ($thisHost, @errors, @noof_nodes) = (shift, (), ());
+   my ($date, $day, $month);
+   my @month_str = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec');
+
+   # hope logfile is flushed each time sysmond is started
+   # if logfile not flushed, I'm only interested in last encounter
+   chomp(@noof_nodes = qx { $thisHost->{CMD}->{EGREP} 'total entries to be monitored' $thisHost->{FILES}->{SYSMONLOG} });
+   ($month,$day,undef,undef,undef,
+    undef,undef,undef,undef,undef, $noofnodes) = split(/\s+/, $noof_nodes[scalar(@noof_nodes)-1], 11);
+
+   # don't really know what to look for right now, so I'll go for the most obvious
+   ($day, $month) = (localtime)[3,4];
+   $date = $month_str[$month] . ' ' . $day;
+   @errors = qx { $thisHost->{CMD}->{EGREP} -i 'error|fail' $thisHost->{FILES}->{SYSMONLOG} | $thisHost->{CMD}->{EGREP} "$date" };
+
+   if (scalar(@errors)) {
+      print LOGFILE "\n------- $thisHost->{FILES}->{SYSMONLOG} results : Monitoring $noofnodes nodes since $month $day --------";
+      print LOGFILE "\n\n@errors\n";
+   }
+
+   return 0;
+}
+
+sub CheckProcesses
+{
+   my ($thisHost, @procs) = (shift, ());
+
+   print LOGFILE "\n------- $thisHost->{CMD}->{PROCESSES} results --------";
+   @procs = qx { $thisHost->{CMD}->{PROCESSES} };
+   print LOGFILE "\n\n@procs\n";
+   # won't do any filtering for now
+
+   return 0;
+}
+
+sub CheckQueueStat
+{
+   my ($thisHost, @queues) = (shift, ());
+
+   print LOGFILE "\n------- $thisHost->{CMD}->{QSTAT} results --------\n";
+   # could filter out the Q flags, but I won't for now
+   #@queues = qx { $thisHost->{CMD}->{QSTAT} -fa };
+   @queues = qx { $thisHost->{CMD}->{QSTAT} -q $thisHost->{HOSTNAME} };
+   print LOGFILE "\n\n@queues\n";
+
+   return 0;
+}
+
+sub CheckNodeProps
+{
+   my ($thisHost, @nodes) = (shift, ());
+   my %node_stats = ();
+   my $key;
+   
+   print LOGFILE "\n------- $thisHost->{CMD}->{NODEPROPS} results --------\n\n";
+   @nodes = qx { $thisHost->{CMD}->{NODEPROPS} -u };
+
+   # remove header line
+   shift @nodes;
+
+   # remove the Totals part + dashed line + empty line at the end
+   $#nodes -= 6;   # not a nice hack, but works :-), replaces 6 x pop
+
+   chomp(@nodes);
+   foreach (@nodes) {
+      (undef, undef, $stat, undef) = split (/\s+/, $_, 4);
+      if (exists $node_stats{$stat}) {
+         $node_stats{$stat}++;
+      } else {
+         $node_stats{$stat} = 1;
+      }
+   }
+   foreach $key (keys %node_stats) {
+      print LOGFILE "Number of $key nodes : $node_stats{$key}\n";
+   }
+   return 0;
+}
+
+sub CheckHardware
+{
+   my ($thisHost, @nodes) = (shift, ());
+
+   @nodes = qx { $thisHost->{CMD}->{NODEINFO} 2>/tmp/nodeInfo.err | 
+                 $thisHost->{CMD}->{EGREP} -i 'error|fail' | 
+                 $thisHost->{CMD}->{EGREP} -v 'errors:0' | 
+                 $thisHost->{CMD}->{EGREP} -v 'ATA Error Count' };
+   if (scalar(@nodes)) {
+      print LOGFILE scalar(@nodes);
+   } else {
+      if (-s '/tmp/nodeInfo.err') {
+         print LOGFILE "\n------- $thisHost->{CMD}->{NODEINFO} results --------";
+         print LOGFILE " : NOK\n";
+         # append error file
+         open (ERR_FILE, '</tmp/nodeInfo.err');
+         while (<ERR_FILE>) {
+           print LOGFILE $_;
+         }
+         close (ERR_FILE);         
+         unlink '/tmp/nodeInfo.err';
+      }
+   }
+ 
+   return 0;
+}
+
+sub GetCommandLine {
+   local @args = @_;
+   local $_;
+
+   while (@args && ($_ = $args[0])) {
+      if (/^-(\w+)/) {
+         CASE : {
+           if ($1 =~ /^log/) { shift(@args); $LOG = $args[0]; last CASE; }
+           if ($1 =~ /^nomail/) { $NOMAIL = 1; last CASE; }
+         }
+      } else {
+         print "Oops: Unknown option : $_\n";
+      }
+      shift(@args);
+   }
+}
+
+
+#######################################
+# Ze start of ze script
+#######################################
+my ($idx, $thisHost);
+
+# What are my options ?
+&GetCommandLine(@ARGV);
+
+# Let's leave a trace
+$LOG = '/tmp/c3_health_' . (localtime)[3] . '_' . (localtime)[4] . '_' . $$ . '.log' unless defined $LOG;
+open(LOGFILE, "+>$LOG") || die "Can't open log file $LOG : $!";
+LOGFILE->autoflush(1);
+
+$thisHost = System::Unix->new;
+croak "No tests in my list for this host." if ! exists $HostCheckMatrix{$thisHost->{HOSTNAME}};
+
+# Now do thou thing
+foreach $idx (0 .. $#{ $HostCheckMatrix{$thisHost->{HOSTNAME}} }) {
+   if ($HostCheckMatrix{$thisHost->{HOSTNAME}}[$idx]) {
+      if (exists $SystemChecks{$HostCheckMatrix{tests}[$idx]}) {
+         &{$SystemChecks{$HostCheckMatrix{tests}[$idx]}}($thisHost);
+      } else {
+         # Fallback to error routine and say why.
+         &{$SystemChecks{'NON-EXIST'}}($HostCheckMatrix{tests}[$idx]);
+      }
+   }
+}
+
+close(LOGFILE) || die "Close log file $LOG failed : $!";
+if ( -s $LOG )  {
+   qx{ $thisHost->{CMD}->{MAILER} -s "Unix/Linux Health Results : $thisHost->{HOSTNAME}" $MAIL_LIST < $LOG } unless $NOMAIL;
+}
+
+END
+{
+   # make sure we cleanup our mess when we get shot
+   qx{ rm -f $LOG } unless $NOMAIL;
+   exit 0;
+}
+
